@@ -11,6 +11,7 @@ import (
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -20,6 +21,42 @@ const (
 	sessionFile = "session.json"
 	configFile  = ".telegram-config"
 )
+
+// terminalAuth implements auth.UserAuthenticator for interactive authentication
+type terminalAuth struct {
+	phone  string
+	reader *bufio.Reader
+}
+
+func (t *terminalAuth) Phone(ctx context.Context) (string, error) {
+	return t.phone, nil
+}
+
+func (t *terminalAuth) Password(ctx context.Context) (string, error) {
+	fmt.Print("Enter your 2FA password: ")
+	password, err := t.reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(password), nil
+}
+
+func (t *terminalAuth) Code(ctx context.Context, sentCode *tg.AuthSentCode) (string, error) {
+	fmt.Print("Enter the code you received: ")
+	code, err := t.reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(code), nil
+}
+
+func (t *terminalAuth) AcceptTermsOfService(ctx context.Context, tos tg.HelpTermsOfService) error {
+	return nil
+}
+
+func (t *terminalAuth) SignUp(ctx context.Context) (auth.UserInfo, error) {
+	return auth.UserInfo{}, fmt.Errorf("sign up not supported, please register with an official Telegram client first")
+}
 
 type Client struct {
 	client *telegram.Client
@@ -124,14 +161,14 @@ func (c *Client) Login(ctx context.Context, phone string) error {
 	return client.Run(ctx, func(ctx context.Context) error {
 		reader := bufio.NewReader(os.Stdin)
 
-		codePrompt := func(ctx context.Context, sentCode *tg.AuthSentCode) (string, error) {
-			fmt.Print("Enter the code you received: ")
-			code, _ := reader.ReadString('\n')
-			return strings.TrimSpace(code), nil
+		// Custom authenticator that handles both code and 2FA password interactively
+		termAuth := &terminalAuth{
+			phone:  phone,
+			reader: reader,
 		}
 
 		flow := auth.NewFlow(
-			auth.CodeOnly(phone, auth.CodeAuthenticatorFunc(codePrompt)),
+			termAuth,
 			auth.SendCodeOptions{},
 		)
 
@@ -418,45 +455,41 @@ func (c *Client) SpamImages(ctx context.Context, chatID int64, imagesDir string,
 			return fmt.Errorf("chat with ID %d not found. Use 'list' command to see available chats", chatID)
 		}
 
-		// Send images
-		uploader := api
+		// Send images using uploader
+		u := uploader.NewUploader(api)
+		
 		for i, imagePath := range imageFiles {
 			fmt.Printf("[%d/%d] Sending %s...\n", i+1, len(imageFiles), filepath.Base(imagePath))
 
-			// Read file
-			fileData, err := os.ReadFile(imagePath)
+			// Open and read file
+			file, err := os.Open(imagePath)
 			if err != nil {
-				fmt.Printf("  ✗ Failed to read file: %v\n", err)
+				fmt.Printf("  ✗ Failed to open file: %v\n", err)
+				continue
+			}
+
+			// Get file info
+			fileInfo, err := file.Stat()
+			if err != nil {
+				file.Close()
+				fmt.Printf("  ✗ Failed to get file info: %v\n", err)
 				continue
 			}
 
 			// Upload file
-			upload, err := uploader.UploadSaveFilePart(ctx, &tg.UploadSaveFilePartRequest{
-				FileID:   time.Now().UnixNano(),
-				FilePart: 0,
-				Bytes:    fileData,
-			})
+			upload, err := u.Upload(ctx, uploader.NewUpload(filepath.Base(imagePath), file, fileInfo.Size()))
+			file.Close()
+			
 			if err != nil {
 				fmt.Printf("  ✗ Failed to upload: %v\n", err)
 				continue
 			}
 
-			if !upload {
-				fmt.Printf("  ✗ Upload failed\n")
-				continue
-			}
-
 			// Send as photo
-			inputFile := &tg.InputFile{
-				ID:    time.Now().UnixNano(),
-				Parts: 1,
-				Name:  filepath.Base(imagePath),
-			}
-
 			_, err = api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
 				Peer: inputPeer,
 				Media: &tg.InputMediaUploadedPhoto{
-					File: inputFile,
+					File: upload,
 				},
 				RandomID: time.Now().UnixNano(),
 			})
